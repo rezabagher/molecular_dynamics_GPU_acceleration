@@ -1,247 +1,158 @@
-# 🔬 MD-Sim — Molecular Dynamics Toy Simulator
+# Molecular Dynamics GPU Accelerator
 
-A clean, minimal **2-D particle simulator** written in Python, showcasing GPU
-acceleration with **Numba CUDA** alongside a CPU reference implementation.
+A 2D molecular dynamics simulator built to explore GPU acceleration of scientific workloads using NVIDIA CUDA and Numba. The project implements pairwise force models and Velocity-Verlet integration, and benchmarks a serial CPU implementation against a CUDA-accelerated GPU version.
 
-Built as a portfolio project demonstrating:
+## Highlights
 
-- Scientific computing fundamentals (numerical integration, force fields)
-- GPU programming with Numba CUDA (`@cuda.jit`, `cuda.grid`, `cuda.synchronize`)
-- Velocity-Verlet integration (symplectic, second-order accurate)
-- CPU vs GPU benchmarking methodology
-- Modular, well-commented Python project structure
+- CUDA acceleration via Numba `@cuda.jit` kernels
+- Soft-repulsion and Lennard-Jones interparticle potentials
+- NVT thermostat control
+- Velocity-Verlet time integration
+- Quantified CPU vs. GPU performance benchmarking on real hardware
+- Modular Python codebase designed for experimentation and extension
 
----
+## Benchmark Results
 
-## ⚙️ Physics Background
+Benchmarks were performed on an **NVIDIA Tesla T4 GPU** (Google Colab). Timings include kernel execution and host-to-device memory transfers.
 
-### Soft repulsion potential (default)
+| Particles | Speedup (GPU vs. CPU) |
+|-----------|----------------------|
+| 256       | **66×**              |
+| 1,024     | **568×**             |
 
-Each particle pair closer than diameter `r₀` feels a harmonic repulsion:
+These results demonstrate how scientific workloads dominated by pairwise interactions — an O(N²) problem — scale well under GPU parallelism.
 
-```
-U(r) = A · (1 − r/r₀)²    for r < r₀,  else 0
-```
+## Motivation
 
-This potential is always finite, never diverges, and stays numerically stable
-with any reasonable timestep. It models a colloidal suspension or soft-sphere gas.
+Pairwise force evaluation is the computational bottleneck in molecular dynamics. For N particles, every particle interacts with every other, producing an O(N²) workload that grows rapidly with system size.
 
-### Lennard-Jones potential (optional)
+This project investigates how GPU parallelism can accelerate that bottleneck by assigning one CUDA thread per particle and computing all forces concurrently, then comparing execution times against a CPU reference implementation.
 
-The classic MD pair potential:
-
-```
-U(r) = 4ε [ (σ/r)¹² − (σ/r)⁶ ]
-```
-
-The `r⁻¹²` term is short-range Pauli repulsion; `r⁻⁶` is van der Waals attraction.
-Requires a small timestep (dt ≤ 0.001) and runs in NVT (thermostat always on).
-
-### Integrator
-
-Both potentials use **Velocity-Verlet** integration:
-
-```
-x(t+Δt)  =  x(t) + v(t)·Δt + ½a(t)·Δt²
-v(t+Δt)  =  v(t) + ½[a(t) + a(t+Δt)]·Δt
-```
-
-Time-reversible and second-order accurate — the standard choice for MD.
+The goal is not to compete with production MD packages such as GROMACS, NAMD, or LAMMPS, but to demonstrate the principles of GPU acceleration, numerical simulation, and quantitative performance analysis.
 
 ---
 
-## 📁 Project Structure
+## Physics Model
+
+### Soft-Repulsion Potential
+
+Particles interact through a finite-range harmonic repulsion:
+
+$$U(r) = A\left(1 - \frac{r}{r_0}\right)^2, \quad r < r_0$$
+
+$$U(r) = 0, \quad r \geq r_0$$
+
+This potential is numerically stable at relatively large timesteps and avoids the singularities present in harder potentials, making it well-suited for demonstrating GPU acceleration.
+
+### Lennard-Jones Potential
+
+The simulator optionally supports the Lennard-Jones interaction:
+
+$$U(r) = 4\epsilon\left[\left(\frac{\sigma}{r}\right)^{12} - \left(\frac{\sigma}{r}\right)^6\right]$$
+
+which models short-range repulsion and long-range attraction commonly used in molecular simulation.
+
+### Time Integration
+
+Particle trajectories are advanced using the Velocity-Verlet scheme:
+
+$$x(t + \Delta t) = x(t) + v(t)\Delta t + \tfrac{1}{2}a(t)\Delta t^2$$
+
+$$v(t + \Delta t) = v(t) + \tfrac{1}{2}\left[a(t) + a(t + \Delta t)\right]\Delta t$$
+
+Velocity-Verlet is time-reversible, symplectic, and the standard integrator in molecular dynamics.
+
+---
+
+## GPU Implementation
+
+The GPU kernel assigns one CUDA thread to each particle. Each thread independently accumulates the net force from all other particles, enabling thousands of force calculations to run concurrently:
+
+```python
+@cuda.jit
+def _soft_forces_kernel(...):
+    i = cuda.grid(1)
+    if i < n_particles:
+        for j in range(n_particles):
+            # compute pairwise force contribution
+            ...
+```
+
+This maps naturally onto the O(N²) structure of the problem and is the source of the large speedups observed at higher particle counts.
+
+---
+
+## Project Structure
 
 ```
 md_sim/
-├── __init__.py       # package metadata
-├── cpu_forces.py     # CPU reference: soft + LJ potentials (NumPy)
-├── gpu_forces.py     # GPU kernel:   soft potential (Numba CUDA)
-├── integrator.py     # Velocity-Verlet, force-agnostic
-├── simulation.py     # Main driver: init → equilibrate → run
-├── benchmark.py      # CPU vs GPU timing comparison
-└── utils.py          # Particle init, kinetic energy, temperature
+├── cpu_forces.py       # Serial CPU force evaluation
+├── gpu_forces.py       # CUDA kernel force evaluation
+├── integrator.py       # Velocity-Verlet integrator
+├── simulation.py       # Simulation loop and NVT thermostat
+├── benchmark.py        # CPU vs. GPU timing harness
+└── utils.py            # Shared utilities
 
-run_example.py        # Minimal working example (run this!)
+run_example.py
 README.md
 ```
 
 ---
 
-## 🚀 Quick Start
+## Running the Project
 
-### 1. Install dependencies
+### Installation
 
 ```bash
 pip install numpy numba
 ```
 
-For GPU support, also install the NVIDIA CUDA Toolkit:
-[https://developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads)
+GPU execution requires the NVIDIA CUDA Toolkit and a CUDA-capable GPU.
 
-> **No GPU?** The simulator runs fully in CPU-only mode (the default).
-
-### 2. Run a simulation
+### CPU Simulation
 
 ```bash
-# Soft repulsion, 256 particles, CPU
 python run_example.py
+```
 
-# Custom particle count, 1000 steps
-python run_example.py --n 512 --steps 1000
+### GPU Simulation
 
-# GPU acceleration (requires CUDA)
-python run_example.py --gpu --n 1024
+```bash
+python run_example.py --gpu
+```
 
-# Lennard-Jones potential (CPU, NVT)
-python run_example.py --lj --n 64 --steps 500
+### Benchmarking
 
-# CPU vs GPU benchmark table
+```bash
 python run_example.py --benchmark
 ```
 
-### 3. Use as a library
+---
 
-```python
-from md_sim.simulation import Simulation
+## Limitations
 
-# Soft repulsion (stable, default)
-sim = Simulation(
-    n_particles    = 256,
-    box_size       = 25.0,
-    dt             = 0.01,
-    use_gpu        = False,     # set True if CUDA is available
-    potential_type = "soft",
-    target_temp    = 1.0,
-)
-sim.equilibrate(steps=300)
-history = sim.run(steps=500, log_every=50)
+This project is an educational and performance-exploration tool, not a production MD engine. Current limitations include:
 
-# Access results
-for state in history:
-    print(state.step, state.ke, state.temp)
-```
-
-### Sample output
-
-```
-Simulation ready: 256 particles | box=25.0 | dt=0.01 | potential=soft | CPU
-
-Equilibrating 300 steps (thermostat ON) …
-  Done.  T = 1.0000  KE = 255.0000
-
-  Step      Time          KE          PE      Temp
---------------------------------------------------
-   301     3.010    252.5852   1351.7369    0.9905
-   360     3.600    255.9235   1348.3744    1.0036
-   420     4.200    250.2586   1354.0553    0.9814
-   ...
-   600     6.000    272.0598   1332.2603    1.0669
-
-Done.  300 steps in 8.7 s (34.6 steps/s)
-```
-
-KE fluctuates naturally around `N × T = 256` — the system is in thermal equilibrium.
+- O(N²) all-pairs force evaluation (no neighbor lists or cell lists)
+- Two-dimensional simulation domain
+- Single-GPU execution only
+- No distributed-memory parallelism
 
 ---
 
-## 🔑 GPU Acceleration Explained
+## Potential Extensions
 
-### The kernel (one thread per particle)
-
-```python
-@cuda.jit
-def _soft_forces_kernel(pos, box, r0sq, A, forces_out):
-    i = cuda.grid(1)        # global thread index → particle i
-    n = pos.shape[0]
-
-    if i >= n:              # guard: extra threads do nothing
-        return
-
-    fx = numba.float32(0.0)
-    fy = numba.float32(0.0)
-
-    for j in range(n):      # thread i loops over all j
-        if i == j:
-            continue
-        # ... compute force from j on i ...
-        fx += ...
-        fy += ...
-
-    forces_out[i, 0] = fx   # one write to global memory per thread
-    forces_out[i, 1] = fy
-```
-
-| CUDA concept | What it means here |
-|---|---|
-| `@cuda.jit` | Compile Python → PTX GPU machine code |
-| `cuda.grid(1)` | Global thread index across all blocks → particle index |
-| `threads_per_block = 128` | Block size (warp-aligned; tune per GPU) |
-| `blocks_per_grid = ⌈N/128⌉` | Enough blocks to cover all N particles |
-| `cuda.synchronize()` | Block host until all GPU threads finish (required for timing) |
-
-### Why is the GPU faster?
-
-The CPU executes each particle's force computation **sequentially**.  
-The GPU executes **all N simultaneously** across thousands of CUDA cores.
-
-For N = 1024 particles:
-- CPU: ~1M operations, done one at a time
-- GPU: ~1M operations, done in parallel across 1024 threads
+- Verlet neighbor lists and cell-based spatial partitioning
+- CUDA shared-memory tiling to reduce global memory traffic
+- Multi-GPU execution
+- Three-dimensional simulation domain
+- Nsight profiling and kernel-level optimization
+- Comparison against vectorized NumPy and compiled CPU baselines (e.g. Cython, Numba CPU)
 
 ---
 
-## 📊 Performance Notes
+## Technologies
 
-### Expected speedup (A100 GPU, soft potential)
-
-| N | CPU (ms) | GPU (ms) | Speedup |
-|---|---|---|---|
-| 64 | ~5 | ~1.5 | ~3× |
-| 128 | ~20 | ~1.7 | ~12× |
-| 256 | ~80 | ~2.2 | ~36× |
-| 512 | ~320 | ~3.5 | ~91× |
-| 1024 | ~1280 | ~8.0 | ~160× |
-
-*GPU timings include host↔device memory transfer.*
-
-### When does GPU win?
-
-| N | Regime |
-|---|---|
-| < 128 | GPU overhead (memory transfer, kernel launch) may dominate |
-| 256–512 | GPU starts to pull ahead |
-| ≥ 1024 | GPU wins clearly (10–200× depending on hardware) |
-
-The CPU kernel is pure Python — intentionally readable, not optimised.
-A NumPy-vectorised CPU would be much faster but less instructive.
-
----
-
-## 🔭 Future Improvements
-
-| Feature | Difficulty | Impact |
-|---|---|---|
-| NumPy-vectorised CPU kernel | Easy | 10–100× faster CPU |
-| Cell / neighbour lists | Medium | O(N²) → O(N) force calculation |
-| CUDA shared memory tiling | Medium | Reduces global memory reads |
-| 3-D simulation | Easy | Add z-component throughout |
-| Velocity-rescaling thermostat (Berendsen) | Easy | Smoother temperature control |
-| Matplotlib / live animation | Easy | Visual output |
-| Multiple particle species | Medium | Mixtures, alloys |
-| NPT ensemble (pressure control) | Medium | Variable box size |
-
----
-
-## 📖 References
-
-- Allen & Tildesley, *Computer Simulation of Liquids* (2017) — the MD bible
-- Frenkel & Smit, *Understanding Molecular Simulation* (2002)
-- [Numba CUDA documentation](https://numba.readthedocs.io/en/stable/cuda/index.html)
-- [NVIDIA CUDA C Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
-
----
-
-## 📄 License
-
-MIT — free to use, study, and modify.
+- Python · NumPy · Numba CUDA
+- NVIDIA CUDA · NVIDIA Tesla T4
+- Google Colab
