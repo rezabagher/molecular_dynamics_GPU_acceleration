@@ -6,6 +6,6 @@ RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/
 WORKDIR /app
 COPY . .
 
-RUN pip3 install -e .
+RUN pip3 install .
 
 ENTRYPOINT ["python3", "run_example.py"]
