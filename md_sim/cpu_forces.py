@@ -20,11 +20,39 @@ TWO potentials are available (selectable via `potential_type`):
 Force formula for soft potential (unit-normalised direction vector):
     F_ij = −∇U = (2A/r₀) · (1 − r/r₀) · r̂_ij   (outward = repulsive)
 
-Force formula for LJ (reduced units, ε = σ = 1):
-    F_ij = (48/r²) [(1/r)¹² − 0.5·(1/r)⁶] · Δr_ij
+Force formula for LJ, with Δr = r_j − r_i  (so Δr points i → j):
+    F_on_i = −(48ε/r²) [(σ/r)¹² − 0.5·(σ/r)⁶] · Δr
+
+The leading minus sign matters: the bracket is positive for
+r < 2^(1/6)σ, so F_on_i then points *away* from j (repulsion), and
+negative beyond the minimum, giving attraction.
 """
 
+# `tuple[...]` in the return annotations below is PEP 585 syntax, which is
+# evaluated at import time on Python < 3.10 and does not exist before 3.9.
+# pyproject declares requires-python >=3.8, so defer annotation evaluation.
+from __future__ import annotations
+
 import numpy as np
+
+#: Potentials understood by compute_forces_cpu (and by Simulation).
+VALID_POTENTIALS = ("soft", "lj")
+
+
+def validate_potential_type(potential_type: str) -> str:
+    """
+    Return `potential_type` unchanged, or raise ValueError if it is not one of
+    VALID_POTENTIALS.
+
+    Single source of truth shared with simulation.Simulation: an unrecognised
+    name used to fall through to the LJ branch silently.
+    """
+    if potential_type not in VALID_POTENTIALS:
+        raise ValueError(
+            f"unknown potential_type {potential_type!r}; expected one of "
+            + ", ".join(repr(p) for p in VALID_POTENTIALS)
+        )
+    return potential_type
 
 
 def compute_forces_cpu(
@@ -58,14 +86,14 @@ def compute_forces_cpu(
     forces    : ndarray (N, 2), float32
     potential : float
     """
-    n = positions.shape[0]
-    forces    = np.zeros((n, 2), dtype=np.float32)
-    potential = 0.0
+    validate_potential_type(potential_type)
+
+    n      = positions.shape[0]
+    forces = np.zeros((n, 2), dtype=np.float32)
 
     if potential_type == "soft":
         return _soft_forces(positions, box_size, n, forces, r0, A)
-    else:
-        return _lj_forces(positions, box_size, n, forces, r_cut, epsilon, sigma)
+    return _lj_forces(positions, box_size, n, forces, r_cut, epsilon, sigma)
 
 
 # ── soft potential ────────────────────────────────────────────────────────────
@@ -133,7 +161,10 @@ def _lj_forces(positions, box_size, n, forces, r_cut, epsilon, sigma):
 
             # F_scalar = (48ε/r²)[(σ/r)^12 - 0.5*(σ/r)^6]
             f_scalar = (48.0 * epsilon / r2) * (sr12 - 0.5 * sr6)
-            forces[i, 0] += f_scalar * dx;  forces[i, 1] += f_scalar * dy
-            forces[j, 0] -= f_scalar * dx;  forces[j, 1] -= f_scalar * dy
+
+            # F_on_i = -∇_i U = -f_scalar * Δr   (Δr = pos[j] - pos[i])
+            # Repulsive at short range: f_scalar > 0 pushes i away from j.
+            forces[i, 0] -= f_scalar * dx;  forces[i, 1] -= f_scalar * dy
+            forces[j, 0] += f_scalar * dx;  forces[j, 1] += f_scalar * dy
 
     return forces, potential

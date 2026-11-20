@@ -22,8 +22,42 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from md_sim.utils import init_particles, kinetic_energy, temperature
 from md_sim.cpu_forces import compute_forces_cpu
+from md_sim.gpu_forces import _CUDA_AVAILABLE, compute_forces_gpu
 from md_sim.integrator import velocity_verlet_step1, velocity_verlet_step2
 from md_sim.simulation import Simulation
+
+requires_cuda = pytest.mark.skipif(
+    not _CUDA_AVAILABLE,
+    reason="CUDA unavailable (set NUMBA_ENABLE_CUDASIM=1 to run on the simulator)",
+)
+
+
+def packed_cluster(n, spacing, margin, seed=4):
+    """
+    `n` particles on a jittered grid with neighbour spacing `spacing`, centred
+    in a periodic box that leaves `margin` empty on every side.
+
+    Both properties matter for a force comparison:
+
+    * `spacing` < interaction range, so the configuration actually interacts.
+      `init_particles(n, box)` derives its spacing from the box and can place
+      every particle beyond the cut-off, which makes a comparison pass by
+      checking 0 against 0.
+    * `margin` >= interaction range and box/2 >= interaction range, so the
+      minimum-image convention is valid: every pair has exactly one image
+      inside the cut-off.  Testing in a box smaller than twice the range
+      pins behaviour from a regime where the model itself is wrong.
+    """
+    rng = np.random.default_rng(seed)
+    cols = int(np.ceil(np.sqrt(n)))
+    idx = np.arange(n)
+    pts = np.column_stack([(idx % cols) * spacing,
+                           (idx // cols) * spacing]).astype(np.float64)
+    pts += rng.uniform(-0.05 * spacing, 0.05 * spacing, pts.shape)
+    box = float((cols - 1) * spacing + 2 * margin)
+    pts -= pts.min(axis=0)
+    pts += (box - pts.max(axis=0)) / 2.0
+    return np.ascontiguousarray(pts, dtype=np.float32), box
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -226,36 +260,28 @@ class TestLJForces:
 
     def test_lj_repulsive_at_short_range(self):
         """
-        BUG: At r < sigma the LJ potential is repulsive, so particle 0 (left)
-        should be pushed left (negative x) and particle 1 (right) pushed right.
-        The current _lj_forces implementation has the force sign inverted:
-        it uses `forces[i] += f_scalar * dx` where dx = pos[j] - pos[i],
-        which pushes particle 0 *toward* j (positive x) instead of away.
-        This test documents the bug; flip the assertions when it is fixed.
+        At r < σ the LJ potential is strongly repulsive, so particle 0 (left)
+        is pushed left (−x) and particle 1 (right) is pushed right (+x).
+
+        Regression test for an inverted force sign in _lj_forces, which used
+        `forces[i] += f_scalar * dx` with dx = pos[j] - pos[i] and therefore
+        pulled overlapping particles together instead of pushing them apart.
         """
         forces, pe = self._lj_pair(r=0.9)
-        # Correct physics (fails until bug is fixed):
-        #   assert forces[0, 0] < 0.0
-        #   assert forces[1, 0] > 0.0
-        # Actual (buggy) behaviour — forces are inverted:
-        assert forces[0, 0] > 0.0, "BUG: force should be negative (repulsive)"
-        assert forces[1, 0] < 0.0, "BUG: force should be positive (repulsive)"
+        assert forces[0, 0] < 0.0, "left particle must be pushed left"
+        assert forces[1, 0] > 0.0, "right particle must be pushed right"
         assert abs(forces[0, 0]) > 1.0, "Repulsive force magnitude should be large at r<sigma"
+        assert pe > 0.0, "LJ potential is positive below σ"
 
     def test_lj_attractive_at_medium_range(self):
         """
-        BUG: At r ≈ 1.2σ (past the minimum, ~1.122σ) LJ is weakly attractive,
-        so particle 0 should be pulled right (+x) toward particle 1.
-        The sign inversion in _lj_forces makes it appear repulsive instead.
-        Flip assertions when the bug is fixed.
+        At r ≈ 1.2σ (past the minimum at 2^(1/6)σ ≈ 1.122σ) LJ is weakly
+        attractive, so particle 0 is pulled right (+x), toward particle 1.
         """
         forces, pe = self._lj_pair(r=1.2)
-        # Correct physics (fails until bug is fixed):
-        #   assert forces[0, 0] > 0.0
-        #   assert forces[1, 0] < 0.0
-        # Actual (buggy) behaviour:
-        assert forces[0, 0] < 0.0, "BUG: force should be positive (attractive)"
-        assert forces[1, 0] > 0.0, "BUG: force should be negative (attractive)"
+        assert forces[0, 0] > 0.0, "left particle must be pulled right"
+        assert forces[1, 0] < 0.0, "right particle must be pulled left"
+        assert pe < 0.0, "LJ potential is negative past the minimum"
 
     def test_lj_zero_beyond_rcut(self):
         """Particles outside r_cut should feel no force."""
@@ -278,6 +304,114 @@ class TestLJForces:
         forces_min, _ = self._lj_pair(r=r_min)
         # Force should be close to zero at minimum
         np.testing.assert_allclose(np.abs(forces_min[0, 0]), 0.0, atol=0.5)
+
+
+class TestForcesMatchPotentialGradient:
+    """
+    The single strongest invariant in an MD force routine: F must equal
+    −∇U of the *same* potential.  These tests recompute U independently and
+    differentiate it numerically, so they catch sign errors, missing or
+    spurious factors of r, and mismatched prefactors in either potential.
+    """
+
+    @staticmethod
+    def _potential(pos, box, kind, **kw):
+        """
+        Reference U(r), written from the documented formulas only.
+
+        Validates `kind` for the same reason compute_forces_cpu does: an
+        oracle that silently treats an unrecognised name as LJ would happily
+        confirm a wrong-potential implementation.
+        """
+        if kind not in ("soft", "lj"):
+            raise ValueError(f"unknown kind {kind!r}")
+        n = len(pos)
+        u = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = pos[j] - pos[i]
+                d -= box * np.round(d / box)          # minimum image
+                r = float(np.hypot(d[0], d[1]))
+                if kind == "soft":
+                    if r < kw["r0"]:
+                        u += kw["A"] * (1.0 - r / kw["r0"]) ** 2
+                else:
+                    if r <= kw["r_cut"]:
+                        sr6 = (kw["sigma"] / r) ** 6
+                        u += 4.0 * kw["epsilon"] * (sr6 * sr6 - sr6)
+        return u
+
+    def _numerical_forces(self, pos, box, kind, h=1e-6, **kw):
+        """F = −dU/dx by central differences."""
+        p = pos.astype(np.float64)
+        F = np.zeros_like(p)
+        for i in range(len(p)):
+            for k in range(2):
+                orig = p[i, k]
+                p[i, k] = orig + h; u_plus  = self._potential(p, box, kind, **kw)
+                p[i, k] = orig - h; u_minus = self._potential(p, box, kind, **kw)
+                p[i, k] = orig
+                F[i, k] = -(u_plus - u_minus) / (2.0 * h)
+        return F
+
+    def test_soft_forces_match_gradient(self):
+        pos = np.array([[5.0, 5.0], [6.3, 5.4], [4.2, 6.1]], dtype=np.float32)
+        kw  = dict(r0=2.0, A=50.0)
+        f_code, pe = compute_forces_cpu(pos, 20.0, potential_type="soft", **kw)
+        f_num = self._numerical_forces(pos, 20.0, "soft", **kw)
+        np.testing.assert_allclose(f_code, f_num, rtol=1e-3, atol=1e-3)
+        assert pe == pytest.approx(
+            self._potential(pos.astype(np.float64), 20.0, "soft", **kw), rel=1e-5
+        )
+
+    @pytest.mark.parametrize("r", [0.9, 1.0, 2.0 ** (1.0 / 6.0), 1.4, 2.0])
+    def test_lj_forces_match_gradient(self, r):
+        """Covers the repulsive branch, the minimum, and the attractive tail."""
+        pos = np.array([[5.0, 5.0], [5.0 + r, 5.0]], dtype=np.float32)
+        kw  = dict(r_cut=2.5, epsilon=1.0, sigma=1.0)
+        f_code, _ = compute_forces_cpu(pos, 50.0, potential_type="lj", **kw)
+        f_num = self._numerical_forces(pos, 50.0, "lj", **kw)
+        np.testing.assert_allclose(f_code, f_num, rtol=1e-3,
+                                   atol=1e-3 * max(1.0, np.abs(f_num).max()))
+
+    def test_lj_forces_match_gradient_many_body(self):
+        """
+        Nine interacting particles, minimum image valid (box/2 > r_cut).
+
+        The tolerance is scaled to the forces actually present and has no
+        `max(1.0, ...)` floor: with init_particles(6, box_size=8.0) only 4 of
+        15 pairs fell inside r_cut and all sat in the far tail at |F| ~ 0.06,
+        so a 1e-2 floor meant an effective 16% tolerance and a 15% error in
+        the LJ prefactor passed unnoticed.  Measured agreement here is ~4e-8
+        relative, so 1e-4 still leaves a ~2000x margin.
+        """
+        kw = dict(r_cut=2.5, epsilon=1.0, sigma=1.0)
+        pos, box = packed_cluster(9, spacing=1.1, margin=kw["r_cut"] + 0.5)
+        f_code, _ = compute_forces_cpu(pos, box, potential_type="lj", **kw)
+        f_num = self._numerical_forces(pos, box, "lj", **kw)
+        assert np.abs(f_num).max() > 1.0, "configuration has no real interactions"
+        np.testing.assert_allclose(f_code, f_num, rtol=1e-4,
+                                   atol=1e-4 * np.abs(f_num).max())
+
+
+class TestPotentialTypeValidation:
+    """An unrecognised potential_type used to fall through to LJ silently."""
+
+    def test_unknown_potential_type_rejected(self):
+        pos = np.array([[5.0, 5.0], [6.0, 5.0]], dtype=np.float32)
+        with pytest.raises(ValueError, match="unknown potential_type"):
+            compute_forces_cpu(pos, box_size=10.0, potential_type="harmonic")
+
+    def test_case_mismatch_rejected(self):
+        """'LJ' is not 'lj': it used to silently select the LJ branch while
+        Simulation still reported (and GPU-dispatched) something else."""
+        pos = np.array([[5.0, 5.0], [6.0, 5.0]], dtype=np.float32)
+        with pytest.raises(ValueError):
+            compute_forces_cpu(pos, box_size=10.0, potential_type="LJ")
+
+    def test_simulation_rejects_unknown_potential(self):
+        with pytest.raises(ValueError, match="unknown potential_type"):
+            Simulation(n_particles=4, box_size=10.0, potential_type="Soft")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -384,10 +518,28 @@ class TestSimulationInit:
                          dt=0.001, seed=0)
         assert sim.potential_type == "lj"
 
-    def test_gpu_fallback_without_cuda(self, capsys):
-        """Should fall back to CPU if CUDA is unavailable."""
+    def test_gpu_flag_tracks_cuda_availability(self, capsys):
+        """
+        use_gpu=True must be honoured where CUDA exists and fall back to the
+        CPU (with a warning) where it does not.
+
+        This previously asserted `sim.use_gpu is False` with the comment
+        "no GPU in CI", which made the test fail on exactly the CUDA hardware
+        the project targets.
+        """
         sim = Simulation(n_particles=4, box_size=10.0, use_gpu=True, seed=0)
-        assert sim.use_gpu is False   # no GPU in CI
+        out = capsys.readouterr().out
+        assert sim.use_gpu is _CUDA_AVAILABLE
+        if not _CUDA_AVAILABLE:
+            assert "CUDA not available" in out
+
+    def test_gpu_declined_for_lj(self, capsys):
+        """The CUDA kernel only implements 'soft', so LJ must stay on the CPU
+        regardless of whether a GPU is present."""
+        sim = Simulation(n_particles=4, box_size=10.0, dt=0.001,
+                         potential_type="lj", use_gpu=True, seed=0)
+        assert sim.use_gpu is False
+        assert "only supports 'soft'" in capsys.readouterr().out
 
 
 class TestSimulationStep:
@@ -531,3 +683,206 @@ class TestEdgeCases:
         sim.equilibrate(steps=10, verbose=False)
         history = sim.run(steps=10, log_every=10, verbose=False)
         assert len(history) >= 1
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Energy conservation — the integrator only conserves E when F = −∇U,
+# so these runs fail loudly if a force routine drifts out of sync again.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestEnergyConservation:
+    def _drift(self, sim, steps):
+        """
+        Relative |E(steps) - E(0)| over a thermostat-free run.
+
+        The baseline is read *before* the first step: taking it after step 1
+        (as this used to) silently excluded the first step's error from every
+        measurement.  PE is NaN on the GPU path (Simulation._compute_forces
+        returns float("nan")), which would turn every assertion below into a
+        silent `NaN < tol` failure, so reject that explicitly.
+        """
+        assert steps >= 1, "need at least one step to measure drift"
+        start = sim._log()
+        e0 = start.ke + start.pe
+        assert not np.isnan(e0), (
+            "potential energy is NaN - the GPU path does not compute PE, so "
+            "energy drift cannot be measured for a use_gpu=True simulation"
+        )
+        for _ in range(steps):
+            state = sim.step(thermostat=False)
+        return abs((state.ke + state.pe) - e0) / (abs(e0) + 1e-12)
+
+    def test_soft_nve_conserves_energy(self):
+        """
+        The soft potential is continuous and finite everywhere, so
+        Velocity-Verlet conserves E very tightly (measured ~1e-6 relative).
+        A loose bound here would hide a mis-scaled force, so keep it tight:
+        measured drift for this configuration is ~6e-7, and injecting the old
+        1/r kernel mis-scaling into the CPU path gives ~4e-2.
+        """
+        sim = Simulation(n_particles=16, box_size=12.0, dt=0.002,
+                         target_temp=0.5, seed=0)
+        assert self._drift(sim, 300) < 1e-5
+
+    def test_lj_bound_pair_stays_bound(self):
+        """
+        Regression test for the inverted LJ force sign, built to be immune to
+        the cut-off artefact below.
+
+        Two particles released at rest at r = 1.2σ sit just outside the LJ
+        minimum (2^(1/6)σ ≈ 1.122σ) with total energy U(1.2σ) < 0, so the
+        correct dynamics is a bound oscillation that can never exceed its
+        release separation.  With the sign inverted the pair is pushed apart
+        and runs away instead.
+
+        The run is 3 time units (dt=1e-3 x 3000).  An earlier version used
+        dt=1e-4 x 2000 = 0.2 time units, which was far too short for the
+        runaway to show: the buggy pair only reached 1.2916σ, so the
+        separation assertions passed and *only* the energy check caught the
+        bug.  Measured here: correct stays in [1.070, 1.200] with 3e-5 drift,
+        inverted reaches 6.37σ with 198% drift.
+        """
+        sim = Simulation(n_particles=2, box_size=30.0, dt=1e-3,
+                         potential_type="lj", target_temp=1.0, seed=0)
+        sim.positions = np.array([[15.0, 15.0], [16.2, 15.0]], dtype=np.float32)
+        sim.velocities = np.zeros((2, 2), dtype=np.float32)
+        sim.forces, sim._pe = sim._compute_forces()
+
+        seps, energies = [], []
+        for _ in range(3000):
+            state = sim.step(thermostat=False)
+            seps.append(abs(float(sim.positions[1, 0] - sim.positions[0, 0])))
+            energies.append(state.ke + state.pe)
+
+        # A bound pair released from rest cannot exceed its release separation.
+        assert max(seps) < 1.25, (
+            f"pair ran away: max separation {max(seps):.3f}σ (expected < 1.25σ)"
+        )
+        assert min(seps) > 1.0, f"pair collapsed: min separation {min(seps):.3f}σ"
+        # No pair ever crosses r_cut here, so energy must be well conserved.
+        drift = abs(energies[-1] - energies[0]) / abs(energies[0])
+        assert drift < 1e-3, f"energy drift {drift:.3%} in a bound LJ pair"
+
+    def test_lj_truncation_drift_is_bounded(self):
+        """
+        Documents a *modelling* limitation, not a bug: this LJ is truncated at
+        r_cut but not shifted, so U jumps by U(r_cut) whenever a pair crosses
+        the cut-off and NVE energy drifts slightly (~1% over 1200 steps).
+        Shifting the potential by U(r_cut) would remove it.
+
+        Measured for this exact configuration: 0.11% at 300 steps, 0.87% at
+        1000, 1.09% at 1200.  The assertion runs the 1200 steps it quotes and
+        bounds them at 2%; a previous version measured at 1200 but asserted
+        over 300 steps, leaving the bound ~45x looser than the phenomenon.
+        """
+        sim = Simulation(n_particles=16, box_size=12.0, dt=0.001,
+                         potential_type="lj", target_temp=1.0, seed=0)
+        assert self._drift(sim, 1200) < 0.02
+
+    def test_lj_overlapping_pair_separates(self):
+        """Two particles well inside σ must fly apart, not collapse."""
+        sim = Simulation(n_particles=2, box_size=20.0, dt=1e-5,
+                         potential_type="lj", target_temp=0.0, seed=0)
+        sim.positions = np.array([[9.6, 10.0], [10.4, 10.0]], dtype=np.float32)
+        sim.velocities = np.zeros((2, 2), dtype=np.float32)
+        sim.forces, sim._pe = sim._compute_forces()
+
+        def sep(s):
+            d = s.positions[1] - s.positions[0]
+            d -= s.box_size * np.round(d / s.box_size)
+            return float(np.hypot(d[0], d[1]))
+
+        r_before = sep(sim)
+        for _ in range(200):
+            sim.step(thermostat=False)
+        assert sep(sim) > r_before, "overlapping LJ particles must repel"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GPU kernel — skipped unless CUDA (or the CUDA simulator) is available
+# ═════════════════════════════════════════════════════════════════════════════
+
+@requires_cuda
+class TestGPUMatchesCPU:
+    """
+    The GPU kernel must reproduce the CPU 'soft' path, which is itself pinned
+    to −∇U by TestForcesMatchPotentialGradient.  The kernel previously divided
+    by r0*r2 instead of r0*r, scaling every pair force by a spurious 1/r —
+    invisible to any test that only checked shapes, symmetry or finiteness.
+    """
+
+    R0, A = 2.0, 50.0
+
+    def _config(self, n):
+        """Interacting cluster with a valid minimum image (see packed_cluster)."""
+        return packed_cluster(n, spacing=1.3, margin=self.R0 + 0.5)
+
+    # n = 33 and n = 130 also cross the 128-thread/block boundary, so they
+    # exercise the multi-block launch and the `i >= n` guard.
+    @pytest.mark.parametrize("n", [2, 4, 33, 130])
+    def test_matches_cpu(self, n):
+        pos, box = self._config(n)
+        f_cpu, _ = compute_forces_cpu(pos, box, potential_type="soft",
+                                      r0=self.R0, A=self.A)
+        f_gpu, pe = compute_forces_gpu(pos, box, r0=self.R0, A=self.A)
+        assert pe is None
+        assert f_gpu.shape == (n, 2)
+        assert f_gpu.dtype == np.float32
+        # Guard against a vacuous pass: if every particle sat beyond r0 the
+        # comparison would be 0 == 0 and the 1/r scaling bug would slip by.
+        scale = float(np.abs(f_cpu).max())
+        assert scale > 1.0, "test configuration has no interactions"
+        # Measured float32 agreement is ~3e-7 relative; 1e-4 leaves a ~300x
+        # margin.  No max(1.0, ...) floor - that would let the tolerance rise
+        # above the signal whenever the forces are small.
+        np.testing.assert_allclose(f_gpu, f_cpu, rtol=1e-4, atol=1e-4 * scale)
+
+    def test_newtons_third_law(self):
+        pos, box = self._config(32)
+        f_gpu, _ = compute_forces_gpu(pos, box, r0=self.R0, A=self.A)
+        scale = float(np.abs(f_gpu).max())
+        assert scale > 1.0, "test configuration has no interactions"
+        np.testing.assert_allclose(f_gpu.sum(axis=0), 0.0, atol=1e-4 * scale)
+
+    def test_accepts_float64_and_noncontiguous_input(self):
+        """
+        Documents which input forms compute_forces_gpu accepts, and why the
+        wrapper's np.ascontiguousarray(..., dtype=float32) is there.
+
+        Contiguity is the load-bearing half.  numba's sentry_contiguous
+        rejects an array that is neither C- nor F-contiguous ("Array contains
+        non-contiguous buffer and cannot be transferred as a single memory
+        region"), so without the coercion such an input raises instead of
+        computing.  Note that np.asfortranarray(pos) and pos.T.copy().T are
+        both F-contiguous and *would* be accepted, so neither of those
+        exercises this path - a column slice of a wider array does.
+
+        Two honest caveats, so this test is not mistaken for more than it is:
+          * The CUDA simulator does not enforce contiguity, so under
+            NUMBA_ENABLE_CUDASIM=1 nothing here fails if the coercion is
+            deleted; it is load-bearing only on real hardware.
+          * The float32 cast is not covered by comparing a float64 run against
+            a float32 run (@cuda.jit just compiles a second specialisation
+            that agrees to well within tolerance) nor by the output dtype
+            (forces_out is an explicitly float32 device array either way).
+            Dropping the cast costs a duplicate kernel compilation, not
+            correctness.
+        """
+        pos, box = self._config(8)
+        f32, _ = compute_forces_gpu(pos, box, r0=self.R0, A=self.A)
+        scale = float(np.abs(f32).max())
+        assert scale > 1.0, "test configuration has no interactions"
+
+        f64, _ = compute_forces_gpu(pos.astype(np.float64), box,
+                                    r0=self.R0, A=self.A)
+        assert f64.dtype == np.float32
+        np.testing.assert_allclose(f64, f32, rtol=1e-4, atol=1e-4 * scale)
+
+        # Neither C- nor F-contiguous: exactly what numba refuses to transfer.
+        buf = np.zeros((len(pos), 3), dtype=np.float32)
+        buf[:, :2] = pos
+        pos_nc = buf[:, :2]
+        assert not pos_nc.flags["C_CONTIGUOUS"]
+        assert not pos_nc.flags["F_CONTIGUOUS"]
+        f_nc, _ = compute_forces_gpu(pos_nc, box, r0=self.R0, A=self.A)
+        np.testing.assert_allclose(f_nc, f32, rtol=1e-4, atol=1e-4 * scale)

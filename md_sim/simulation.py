@@ -31,7 +31,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .utils      import init_particles, kinetic_energy, temperature
-from .cpu_forces import compute_forces_cpu
+from .cpu_forces import compute_forces_cpu, validate_potential_type
 from .gpu_forces import compute_forces_gpu, _CUDA_AVAILABLE
 from .integrator import velocity_verlet_step1, velocity_verlet_step2
 
@@ -80,6 +80,8 @@ class Simulation:
         r_cut:          float = 2.5,
         seed:           int   = 42,
     ):
+        validate_potential_type(potential_type)
+
         self.n_particles    = n_particles
         self.box_size       = box_size
         self.dt             = dt
@@ -99,7 +101,6 @@ class Simulation:
         self.positions, self.velocities = init_particles(
             n_particles, box_size, seed, target_temp
         )
-        self.forces = np.zeros((n_particles, 2), dtype=np.float32)
         self.forces, self._pe = self._compute_forces()
 
         self._step = 0

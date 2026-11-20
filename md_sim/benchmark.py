@@ -20,8 +20,11 @@ GPU timings include host↔device memory transfers (the realistic case).
 cuda.synchronize() is called inside the GPU wrapper, so timing is exact.
 """
 
+from __future__ import annotations   # PEP 585 annotations below; see cpu_forces
+
 import time
 import textwrap
+from typing import Sequence
 
 import numpy as np
 
@@ -46,7 +49,7 @@ def _time_fn(fn, repeats: int = 5) -> tuple[float, float]:
 
 
 def run_benchmark(
-    particle_counts: list[int] = (64, 128, 256, 512, 1024),
+    particle_counts: Sequence[int] = (64, 128, 256, 512, 1024),
     box_size:        float      = 25.0,
     r0:              float      = 2.0,
     A:               float      = 50.0,

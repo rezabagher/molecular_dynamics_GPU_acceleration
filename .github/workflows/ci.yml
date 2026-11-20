@@ -20,8 +20,34 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+  gpu-kernel-sim:
+    # The TestGPUMatchesCPU tests skip on a GPU-less runner, which left the
+    # CUDA kernel in md_sim/gpu_forces.py with no automated coverage at all.
+    # Numba's CUDA simulator executes the kernel in pure Python, so the
+    # CPU/GPU equivalence tests run for real on ordinary CI hardware.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -e .
+          pip install pytest numpy numba
+      - name: Verify the CUDA simulator is active
+        env:
+          NUMBA_ENABLE_CUDASIM: "1"
+        run: |
+          python -c "from md_sim.gpu_forces import _CUDA_AVAILABLE as a; assert a, 'CUDA simulator inactive - GPU kernel tests would silently skip'"
+      - name: Run tests on the CUDA simulator
+        env:
+          NUMBA_ENABLE_CUDASIM: "1"
+        run: pytest tests/ -v
+
   docker:
-    needs: test
+    needs: [test, gpu-kernel-sim]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

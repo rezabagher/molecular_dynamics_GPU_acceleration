@@ -151,6 +151,16 @@ This project is an educational and performance-exploration tool, not a productio
 - Two-dimensional simulation domain
 - Single-GPU execution only
 - No distributed-memory parallelism
+- The Lennard-Jones potential is truncated at `r_cut` but **not shifted**, so
+  `U` jumps by `U(r_cut)` whenever a pair crosses the cut-off. In an NVE run
+  this leaks energy: measured ~0.9% over 1,000 steps for `potential_type='lj'`
+  with N=16, box=12.0, dt=0.001. Subtracting `U(r_cut)` inside the cut-off
+  would remove it. Neither default path is affected — the default soft
+  potential is continuous in both `U` and `dU/dr` at `r0` (drift ~6e-7), and
+  `run_example.py --lj` runs NVT with the thermostat on.
+- The CUDA kernel implements the soft potential only, and returns forces
+  without potential energy (that would need atomic reductions), so `PE` reads
+  `N/A` on the GPU path
 
 ---
 

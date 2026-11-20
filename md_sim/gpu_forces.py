@@ -21,14 +21,18 @@ Thread indexing
     We map: global_thread_index  →  particle_index_i
 """
 
+from __future__ import annotations   # PEP 585 annotations below; see cpu_forces
+
 import numpy as np
 
 # ── detect CUDA availability ─────────────────────────────────────────────────
+# Any failure here (numba missing, broken CUDA driver, unsupported numpy ABI)
+# must degrade to the CPU path rather than break `import md_sim`.
 try:
     from numba import cuda
     import numba
-    _CUDA_AVAILABLE = cuda.is_available()
-except ImportError:
+    _CUDA_AVAILABLE = bool(cuda.is_available())
+except Exception:
     _CUDA_AVAILABLE = False
     cuda   = None
     numba  = None
@@ -43,7 +47,7 @@ def _define_cuda_kernel():
     """
 
     @cuda.jit
-    def _soft_forces_kernel(pos, box, r0sq, A, forces_out):
+    def _soft_forces_kernel(pos, box, r0, A, forces_out):
         """
         GPU kernel: one thread → one particle i.
 
@@ -51,9 +55,13 @@ def _define_cuda_kernel():
         ----------
         pos        : float32[N, 2]  particle positions
         box        : float32        box side length
-        r0sq       : float32        interaction range squared (r₀²)
+        r0          : float32       interaction diameter (r₀)
         A          : float32        repulsion strength
         forces_out : float32[N, 2]  output forces (written once per thread)
+
+        r₀ is passed rather than r₀² so the device never computes
+        sqrt(float32(r0**2)), which can differ from the host's r₀ by an ulp
+        and put a systematic offset into every GPU/CPU comparison.
         """
         i = cuda.grid(1)     # global thread index == particle i
         n = pos.shape[0]
@@ -67,6 +75,10 @@ def _define_cuda_kernel():
         xi = pos[i, 0]
         yi = pos[i, 1]
 
+        # Loop-invariant quantities: compute once per thread, not per pair.
+        r0sq     = r0 * r0
+        half_box = box * numba.float32(0.5)
+
         for j in range(n):
             if i == j:
                 continue
@@ -75,7 +87,6 @@ def _define_cuda_kernel():
             dx = pos[j, 0] - xi
             dy = pos[j, 1] - yi
 
-            half_box = box * numba.float32(0.5)
             if dx >  half_box: dx -= box
             if dx < -half_box: dx += box
             if dy >  half_box: dy -= box
@@ -86,11 +97,12 @@ def _define_cuda_kernel():
             # ── soft repulsion ───────────────────────────────────────────────
             if r2 < r0sq and r2 > numba.float32(1e-14):
                 r       = r2 ** numba.float32(0.5)
-                r0      = r0sq ** numba.float32(0.5)
                 overlap = numba.float32(1.0) - r / r0
 
-                # |F| / r = 2A * overlap / (r0 * r²)  →  F_vec = |F|/r * dr
-                f_over_r = numba.float32(2.0) * A * overlap / (r0 * r2)
+                # |F| = 2A * overlap / r0, so  |F| / r = 2A * overlap / (r0 * r)
+                # and  F_vec = (|F| / r) * dr.  Dividing by r2 here instead of r
+                # would scale every pair force by a spurious 1 / r.
+                f_over_r = numba.float32(2.0) * A * overlap / (r0 * r)
 
                 fx -= f_over_r * dx   # repel i away from j
                 fy -= f_over_r * dy
@@ -102,10 +114,16 @@ def _define_cuda_kernel():
     return _soft_forces_kernel
 
 
+_soft_forces_kernel = None
 if _CUDA_AVAILABLE:
-    _soft_forces_kernel = _define_cuda_kernel()
-else:
-    _soft_forces_kernel = None
+    # @cuda.jit decoration can still fail even when cuda.is_available() is
+    # True (numba/numpy ABI mismatch, target init errors).  Degrade to the CPU
+    # path instead of letting `import md_sim` die.
+    try:
+        _soft_forces_kernel = _define_cuda_kernel()
+    except Exception as exc:        # pragma: no cover - needs a broken CUDA stack
+        print(f"[Warning] CUDA kernel compilation failed ({exc}); using CPU.")
+        _CUDA_AVAILABLE = False
 
 
 # ── host-side wrapper ─────────────────────────────────────────────────────────
@@ -130,12 +148,24 @@ def compute_forces_gpu(
     -------
     forces : ndarray (N, 2), float32
     None   — potential energy not computed on GPU (would need atomic adds)
+
+    Preconditions
+    -------------
+    `positions` must already lie inside [0, box_size).  The kernel applies a
+    single minimum-image shift per axis (one ±box correction), which is exact
+    for in-box coordinates but — unlike the CPU path's round()-based fold —
+    does not wrap offsets beyond 1.5·box.  Feeding it unwrapped coordinates
+    silently drops interactions rather than raising.  `Simulation` wraps every
+    step (integrator.velocity_verlet_step1), so this always holds there.
     """
     if not _CUDA_AVAILABLE:
         raise RuntimeError(
             "Numba CUDA is not available. Use use_gpu=False for the CPU path."
         )
 
+    # The kernel's constants and the output array are float32; make sure the
+    # input matches so the kernel is not recompiled for another dtype.
+    positions = np.ascontiguousarray(positions, dtype=np.float32)
     n = positions.shape[0]
 
     # copy positions to GPU
@@ -150,7 +180,7 @@ def compute_forces_gpu(
     _soft_forces_kernel[blocks_per_grid, threads_per_block](
         d_pos,
         np.float32(box_size),
-        np.float32(r0 ** 2),
+        np.float32(r0),
         np.float32(A),
         d_forces,
     )
